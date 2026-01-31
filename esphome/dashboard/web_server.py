@@ -1575,7 +1575,9 @@ def _ensure_host_logs_autopick_script_in_template() -> None:
     except OSError:
         return
 
-    template_path = override_dir / "index.template.html"
+    # Patch the base template (index extends it); this ensures the helper runs on the main
+    # dashboard page without requiring the child templates to include extra code.
+    template_path = override_dir / "base.template.html"
     try:
         html_text = template_path.read_text(encoding="utf-8")
     except OSError:
