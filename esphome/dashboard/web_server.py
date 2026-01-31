@@ -1563,7 +1563,7 @@ def _ensure_host_logs_autopick_script_in_template() -> None:
     try:
         config_dir = Path(settings.config_dir)
         override_dir = config_dir / ".esphome" / "dashboard_templates"
-        mkdir_p(str(override_dir))
+        mkdir_p(override_dir)
     except OSError:
         return
 
