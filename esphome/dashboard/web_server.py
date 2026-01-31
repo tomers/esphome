@@ -1530,6 +1530,15 @@ def get_static_file_url(name: str) -> str:
 
 
 _HOST_LOGS_AUTOPICK_MARKER = "esphome-host-logs-autopick"
+_frontend_template_path_override: Path | None = None
+
+
+def _get_frontend_template_path() -> Path:
+    """Return the template path for the dashboard frontend.
+
+    If we created a writable override (to inject small fixes), prefer it.
+    """
+    return _frontend_template_path_override or get_base_frontend_path()
 
 
 def _ensure_host_logs_autopick_script_in_template() -> None:
@@ -1544,7 +1553,29 @@ def _ensure_host_logs_autopick_script_in_template() -> None:
         # In dev mode the frontend code should be changed directly.
         return
 
-    template_path = get_base_frontend_path() / "index.template.html"
+    global _frontend_template_path_override
+
+    base_frontend = get_base_frontend_path()
+
+    # The site-packages templates are not writable in many environments (including
+    # OpenApp's container), so copy templates into a writable location under /config
+    # and patch the copied index template.
+    try:
+        config_dir = Path(settings.config_dir)
+        override_dir = config_dir / ".esphome" / "dashboard_templates"
+        mkdir_p(str(override_dir))
+    except OSError:
+        return
+
+    try:
+        for tpl in base_frontend.glob("*.template.html"):
+            dst = override_dir / tpl.name
+            if not dst.is_file():
+                shutil.copyfile(tpl, dst)
+    except OSError:
+        return
+
+    template_path = override_dir / "index.template.html"
     try:
         html_text = template_path.read_text(encoding="utf-8")
     except OSError:
@@ -1628,6 +1659,8 @@ def _ensure_host_logs_autopick_script_in_template() -> None:
         # Non-fatal; dashboard will still work with the default behavior.
         return
 
+    _frontend_template_path_override = override_dir
+
 
 def make_app(debug=get_bool_env(ENV_DEV)) -> tornado.web.Application:
     _ensure_host_logs_autopick_script_in_template()
@@ -1672,7 +1705,7 @@ def make_app(debug=get_bool_env(ENV_DEV)) -> tornado.web.Application:
         "cookie_secret": settings.cookie_secret,
         "log_function": log_function,
         "websocket_ping_interval": 30.0,
-        "template_path": get_base_frontend_path(),
+        "template_path": _get_frontend_template_path(),
         "xsrf_cookies": settings.using_password,
     }
     rel = settings.relative_url
