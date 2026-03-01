@@ -1499,6 +1499,14 @@ class JsonConfigRequestHandler(BaseHandler):
 
 def get_base_frontend_path() -> Path:
     if ENV_DEV not in os.environ:
+        # Prefer a locally built dashboard bundle when running from a source checkout.
+        # This allows forks to ship customized dashboard behavior without changing the
+        # pinned PyPI `esphome-dashboard` dependency.
+        repo_root = Path(__file__).resolve().parents[2]
+        vendored_frontend = repo_root / "dashboard" / "esphome_dashboard"
+        if vendored_frontend.is_dir():
+            return vendored_frontend
+
         import esphome_dashboard
 
         return esphome_dashboard.where()
@@ -1534,7 +1542,144 @@ def get_static_file_url(name: str) -> str:
     return f"{base}?hash={hash_}"
 
 
+_HOST_LOGS_AUTOPICK_MARKER = "esphome-host-logs-autopick"
+_frontend_template_path_override: Path | None = None
+
+
+def _get_frontend_template_path() -> Path:
+    """Return the template path for the dashboard frontend.
+
+    If we created a writable override (to inject small fixes), prefer it.
+    """
+    return _frontend_template_path_override or get_base_frontend_path()
+
+
+def _ensure_host_logs_autopick_script_in_template() -> None:
+    """Patch dashboard template to skip logs target dialog for host devices.
+
+    The shipped dashboard frontend always opens a "pick logs target" dialog when the user
+    clicks "Logs". For host-platform devices this dialog is irrelevant. We inject a small
+    helper script into the main dashboard template that watches for the dialog and, when
+    opened for a host device configuration, automatically selects the wireless (OTA) option.
+    """
+    if ENV_DEV in os.environ:
+        # In dev mode the frontend code should be changed directly.
+        return
+
+    global _frontend_template_path_override
+
+    base_frontend = get_base_frontend_path()
+
+    # The site-packages templates are not writable in many environments (including
+    # OpenApp's container), so copy templates into a writable location under /config
+    # and patch the copied index template.
+    try:
+        config_dir = Path(settings.config_dir)
+        override_dir = config_dir / ".esphome" / "dashboard_templates"
+        mkdir_p(override_dir)
+    except OSError:
+        return
+
+    try:
+        for tpl in base_frontend.glob("*.template.html"):
+            dst = override_dir / tpl.name
+            if not dst.is_file():
+                shutil.copyfile(tpl, dst)
+    except OSError:
+        return
+
+    # Patch the base template (index extends it); this ensures the helper runs on the main
+    # dashboard page without requiring the child templates to include extra code.
+    template_path = override_dir / "base.template.html"
+    try:
+        html_text = template_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    if _HOST_LOGS_AUTOPICK_MARKER in html_text:
+        return
+
+    insert_before = "</body>"
+    if insert_before not in html_text:
+        return
+
+    # Keep the script self-contained and resilient: fetch /devices once and build a set
+    # of host configurations, then auto-click the OTA list item when the dialog appears.
+    script = f"""
+<!-- {_HOST_LOGS_AUTOPICK_MARKER} -->
+<script>
+(() => {{
+  const HOST_TARGET = "HOST";
+  let hostConfigsPromise;
+
+  const getHostConfigs = () => {{
+    if (!hostConfigsPromise) {{
+      hostConfigsPromise = fetch("./devices")
+        .then((resp) => resp.json())
+        .then((data) => {{
+          const configured = (data && data.configured) || [];
+          const hostConfigs = new Set();
+          for (const dev of configured) {{
+            const tp = ((dev && dev.target_platform) || "").toUpperCase();
+            const integrations = (dev && dev.loaded_integrations) || [];
+            const isHost = tp === HOST_TARGET || integrations.includes("host");
+            if (isHost && dev && dev.configuration) {{
+              hostConfigs.add(dev.configuration);
+            }}
+          }}
+          return hostConfigs;
+        }})
+        .catch(() => new Set());
+    }}
+    return hostConfigsPromise;
+  }};
+
+  const tryAutoPick = async (dialogEl) => {{
+    const cfg = dialogEl && dialogEl.configuration;
+    if (!cfg) return;
+    const hostConfigs = await getHostConfigs();
+    if (!hostConfigs.has(cfg)) return;
+
+    // The first option ("Wirelessly") has dialogAction="close" and selects OTA logs.
+    const root = dialogEl.shadowRoot;
+    if (!root) return;
+    const wireless = root.querySelector(\"mwc-list-item[dialogAction='close']\");
+    if (wireless) wireless.click();
+  }};
+
+  const observer = new MutationObserver((mutations) => {{
+    for (const m of mutations) {{
+      for (const node of m.addedNodes) {{
+        if (!(node instanceof HTMLElement)) continue;
+        const dialogEl = node.matches(\"esphome-logs-target-dialog\")
+          ? node
+          : node.querySelector(\"esphome-logs-target-dialog\");
+        if (dialogEl) {{
+          // Don't block mutation processing; attempt async auto-pick.
+          tryAutoPick(dialogEl);
+        }}
+      }}
+    }}
+  }});
+
+  observer.observe(document.body, {{ childList: true, subtree: true }});
+}})();
+</script>
+"""
+
+    patched = html_text.replace(insert_before, f"{script}\n{insert_before}")
+    try:
+        template_path.write_text(patched, encoding="utf-8")
+    except OSError:
+        # Non-fatal; dashboard will still work with the default behavior.
+        return
+
+    _frontend_template_path_override = override_dir
+
+
 def make_app(debug=get_bool_env(ENV_DEV)) -> tornado.web.Application:
+    _ensure_host_logs_autopick_script_in_template()
+
     def log_function(handler: tornado.web.RequestHandler) -> None:
         if handler.get_status() < 400:
             log_method = access_log.info
@@ -1575,7 +1720,7 @@ def make_app(debug=get_bool_env(ENV_DEV)) -> tornado.web.Application:
         "cookie_secret": settings.cookie_secret,
         "log_function": log_function,
         "websocket_ping_interval": 30.0,
-        "template_path": get_base_frontend_path(),
+        "template_path": _get_frontend_template_path(),
         "xsrf_cookies": settings.using_password,
     }
     rel = settings.relative_url
